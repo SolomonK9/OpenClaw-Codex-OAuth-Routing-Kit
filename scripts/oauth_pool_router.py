@@ -51,6 +51,109 @@ def parse_iso(s: Optional[str]) -> Optional[dt.datetime]:
     except Exception:
         return None
 
+def parse_any_datetime(value: Any) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            # OAuth profile stores commonly use epoch milliseconds.
+            return dt.datetime.fromtimestamp(float(value) / 1000.0, dt.timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        parsed = parse_iso(value)
+        if parsed is not None:
+            return parsed
+        try:
+            return dt.datetime.fromtimestamp(float(value) / 1000.0, dt.timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def auth_refresh_grace_minutes(config: Optional[Dict[str, Any]] = None) -> int:
+    cfg = config if isinstance(config, dict) else {}
+    refresh_cfg = cfg.get("oauthAutoRefresh", {}) if isinstance(cfg.get("oauthAutoRefresh"), dict) else {}
+    alerts_cfg = cfg.get("alerts", {}) if isinstance(cfg.get("alerts"), dict) else {}
+    raw = refresh_cfg.get("graceMinutes", alerts_cfg.get("expiryRefreshGraceMinutes", 90))
+    try:
+        return max(10, int(raw))
+    except Exception:
+        return 90
+
+
+def usage_success_after_expiry(acc: Dict[str, Any], expires_at: Optional[dt.datetime]) -> bool:
+    if expires_at is None:
+        return False
+    usage = acc.get("usage", {}) if isinstance(acc.get("usage"), dict) else {}
+    if usage.get("available") is not True:
+        return False
+    if str(usage.get("source") or "") not in {"per-profile", "provider-api-per-profile", "probe", "active-profile"}:
+        return False
+    observed_at = parse_any_datetime(usage.get("observedAt"))
+    return bool(observed_at and observed_at >= expires_at)
+
+
+def expiry_truth_for_account(acc: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    health = acc.get("health", {}) if isinstance(acc.get("health"), dict) else {}
+    auth = acc.get("auth", {}) if isinstance(acc.get("auth"), dict) else {}
+    usage = acc.get("usage", {}) if isinstance(acc.get("usage"), dict) else {}
+    expires_at = parse_any_datetime(health.get("expiresAt"))
+    now = now_utc()
+    days_left = None
+    minutes_since_expiry = None
+    if expires_at is not None:
+        delta = (expires_at - now).total_seconds()
+        days_left = round(delta / 86400.0, 2)
+        if delta <= 0:
+            minutes_since_expiry = round(abs(delta) / 60.0, 1)
+    access_expired = bool(health.get("expired", False)) or (days_left is not None and days_left <= 0)
+    auth_status = str(auth.get("status") or "UNKNOWN").upper()
+    auth_reason = str(auth.get("reason") or "").lower()
+    usage_reason = str(usage.get("reason") or "").lower()
+    refresh_failed = bool(
+        auth_status in {"DEAD", "UNAUTHORIZED", "AUTH"}
+        or usage_reason == "http_401"
+        or any(token in auth_reason for token in ["invalid", "unauthorized", "refresh", "reauth"])
+    )
+    grace = auth_refresh_grace_minutes(config)
+    grace_elapsed = bool(minutes_since_expiry is not None and minutes_since_expiry >= grace)
+    recovered = bool(access_expired and usage_success_after_expiry(acc, expires_at))
+    reauth_needed = bool(refresh_failed or (access_expired and grace_elapsed and not recovered))
+    refresh_pending = bool(access_expired and not recovered and not reauth_needed)
+    if recovered:
+        state = "auto_refresh_recovered"
+    elif reauth_needed and refresh_failed:
+        state = "manual_reauth_required"
+    elif reauth_needed:
+        state = "refresh_grace_failed"
+    elif refresh_pending:
+        state = "access_expired_refresh_pending"
+    elif days_left is not None and days_left <= 1:
+        state = "refresh_due_1d"
+    elif days_left is not None and days_left <= 2:
+        state = "refresh_due_2d"
+    elif days_left is not None and days_left <= 7:
+        state = "refresh_due_7d"
+    elif expires_at is not None:
+        state = "healthy"
+    else:
+        state = "unknown"
+    return {
+        "expiresAt": expires_at.isoformat() if expires_at else None,
+        "daysLeft": days_left,
+        "minutesSinceExpiry": minutes_since_expiry,
+        "expiryState": state,
+        "accessExpired": access_expired,
+        "refreshPending": refresh_pending,
+        "autoRefreshRecovered": recovered,
+        "reauthNeeded": reauth_needed,
+        "manualReauthRequired": reauth_needed,
+        "refreshFailed": refresh_failed,
+        "graceMinutes": grace,
+        "graceElapsed": grace_elapsed,
+    }
+
 
 def timeout_tier(config: Dict[str, Any], tier: str = "standard") -> int:
     defaults = {"health": 3, "quick": 180, "standard": 600, "long": 1800}
@@ -688,7 +791,8 @@ def healthy_profiles(config: Dict[str, Any], state: Dict[str, Any]) -> List[str]
             continue
         if is_quarantined(st) or is_live_failover_active(st):
             continue
-        if h.get("expired") or not h.get("healthy", True):
+        expiry_truth = expiry_truth_for_account(st, config)
+        if expiry_truth.get("reauthNeeded") or expiry_truth.get("refreshPending") or not h.get("healthy", True):
             continue
         u = st.get("usage", {})
         if require_known_usage and (u.get("source") == "unknown"):
@@ -906,9 +1010,16 @@ def merge_health_update(config: Dict[str, Any], target_state: Dict[str, Any], ob
         st = target_state["accounts"][pid]
         prev_h = st.get("health", {}) if isinstance(st.get("health"), dict) else {}
         st["health"] = evaluate_profile_health(config, prev_h, observed.get(pid))
+        h = st.get("health", {}) if isinstance(st.get("health"), dict) else {}
+        expiry_truth = expiry_truth_for_account(st, config)
+        if h.get("expired") and expiry_truth.get("refreshPending"):
+            auth = st.get("auth", {}) if isinstance(st.get("auth"), dict) else {}
+            auth.update({"status": "UNKNOWN", "reason": "access_expired_refresh_pending", "source": "models_status", "at": ts()})
+            st["auth"] = auth
+            append_history(target_state, {"at": ts(), "type": "access_expired_refresh_pending", "profileId": pid, "graceMinutes": expiry_truth.get("graceMinutes"), "minutesSinceExpiry": expiry_truth.get("minutesSinceExpiry")})
         if pid not in observed:
             missing_profiles.append(pid)
-        if st.get("health", {}).get("healthy") is False:
+        if h.get("healthy") is False and not expiry_truth.get("refreshPending"):
             unhealthy_profiles.append(pid)
         _ = is_quarantined(st)
 
@@ -2140,7 +2251,8 @@ def pool_usage_metrics(config: Dict[str, Any], state: Dict[str, Any]) -> Dict[st
     for pid in enabled_ids:
         acc = (state.get("accounts", {}) or {}).get(pid, {})
         h = acc.get("health", {}) if isinstance(acc, dict) else {}
-        if h.get("healthy", True) and not h.get("expired", False) and (not is_quarantined(acc)):
+        expiry_truth = expiry_truth_for_account(acc, config)
+        if h.get("healthy", True) and not expiry_truth.get("reauthNeeded") and not expiry_truth.get("refreshPending") and (not is_quarantined(acc)):
             healthy_ids.append(pid)
 
     for pid in eligible_ids:
@@ -2575,14 +2687,35 @@ def emit_monitor_alerts(config: Dict[str, Any], state: Dict[str, Any], cli_timeo
         h = st.get("health", {})
         q = st.get("quarantine", {})
 
-        if h.get("expired"):
-            key = f"expired:{pid}"
+        expiry_truth = expiry_truth_for_account(st, config)
+        if expiry_truth.get("reauthNeeded"):
+            key = f"manual_reauth_required:{pid}"
             if should_emit_signal(state, key, 10):
-                r = send_alert(config, state, "CRITICAL", f"OAuth account {account_name(config, pid)} ({pid}) expired.", code="PROFILE_EXPIRED", impact="This profile cannot be used for routing until re-authenticated.", auto_action="Router excluded the expired profile.", your_action="Re-auth this profile now.", status=f"profile={pid}")
+                r = send_alert(
+                    config,
+                    state,
+                    "CRITICAL",
+                    f"OAuth account {account_name(config, pid)} ({pid}) did not auto-refresh and needs manual reauth.",
+                    code="PROFILE_MANUAL_REAUTH_REQUIRED",
+                    impact="The access token expired and automatic refresh/probe did not restore the account inside the grace window, or the provider returned an auth failure.",
+                    auto_action="Router keeps this profile out of safe routing until it passes auth/usage proof again.",
+                    your_action="Re-auth this specific profile now.",
+                    status=f"profile={pid}; expiryState={expiry_truth.get('expiryState')}; minutesSinceExpiry={expiry_truth.get('minutesSinceExpiry')}; graceMinutes={expiry_truth.get('graceMinutes')}",
+                )
                 mark_signal(state, key)
                 events.append({"type": key, "alert": r})
+        elif expiry_truth.get("refreshPending"):
+            key = f"refresh_pending:{pid}"
+            if should_emit_signal(state, key, 720):
+                mark_signal(state, key)
+                events.append({"type": key, "alert": {"skipped": "access_expired_refresh_pending", "profileId": pid}})
+        elif expiry_truth.get("autoRefreshRecovered"):
+            key = f"auto_refresh_recovered:{pid}"
+            if should_emit_signal(state, key, 1440):
+                mark_signal(state, key)
+                events.append({"type": key, "alert": {"skipped": "auto_refresh_recovered", "profileId": pid}})
 
-        if h.get("healthy") is False:
+        if h.get("healthy") is False and not expiry_truth.get("refreshPending"):
             key = f"unhealthy:{pid}"
             if should_emit_signal(state, key, 10):
                 reason = str(h.get("reason") or "")
@@ -2696,7 +2829,8 @@ def cached_health_truth_summary(config: Dict[str, Any], state: Dict[str, Any]) -
         h = acc.get("health", {}) if isinstance(acc, dict) else {}
         if not parse_iso(h.get("observedAt")) if isinstance(h, dict) else True:
             missing_truth.append(pid)
-        if h.get("healthy") is False:
+        expiry_truth = expiry_truth_for_account(acc if isinstance(acc, dict) else {}, config)
+        if h.get("healthy") is False and not expiry_truth.get("refreshPending"):
             unhealthy_profiles.append(pid)
         if h.get("stage") in {"suspect", "confirm", "missing"}:
             missing_profiles.append(pid)
